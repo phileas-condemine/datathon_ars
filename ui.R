@@ -31,11 +31,11 @@ dashboardPage(
     ),
     fluidRow(
       tags$h3("Variation autour des moyennes de saison de la météo, de la pollution et des tendances de recherche Google"),
-      box(width = 4, selectInput("var_meteo","Données météo",selected = c("temp_min","temp_max"),choices = c("temp_min","temp_max","pression","humidité","force du vent")),
+      box(width = 4, selectInput("var_meteo","Données météo",selected = c("temp_min","temp_max"),multiple = T,choices = c("temp_min","temp_max","pression","humidité","force du vent")),
           plotlyOutput("variation_meteo"),collapsible = T,collapsed = T),
-      box(width = 4, selectInput("var_pollution","Données de pollution",selected = c("O3","NO2"),choices = c("CO","PM25","PM10","O3","NO2")),
+      box(width = 4, selectInput("molecule","Données de pollution",selected = c("O3"),multiple=F,choices = c("CO","PM25","PM10","O3","NO2")),
           plotlyOutput("variation_pollution"),collapsible = T,collapsed = T),
-      box(width = 4, selectInput("var_meteo","Données météo",selected = c("rhinopharyngite"),choices = c("doctolib","rhinopharyngite","maux de ventre")),
+      box(width = 4, selectInput("trend","Données tendances Google",selected = c("rhinopharyngite"),multiple=F,choices = vars_gtrends),
           plotlyOutput("variation_gtrends"),collapsible = T,collapsed = T)
       
     )

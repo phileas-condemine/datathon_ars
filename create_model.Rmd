@@ -58,6 +58,7 @@ geo_pollution = fread("data/datasets/annexes/geo_pollution.csv")
 geo_cp= fread("data/datasets/annexes/geo_code_postal.csv")
 
 
+
 ```
 
 
@@ -345,6 +346,7 @@ for (my_mode_sortie in c(
 ```
 
 
+## Amélioration itérative
 
 
 ```{r eval=F}
@@ -405,9 +407,15 @@ save(perf_models,file=paste0("data/res_",my_mode_sortie,".RData"))
 
 
 ```{r}
+mean(abs(data$nb-data$nb_lagged1))
+mean(abs(data$nb-data$nb_lagged7))
+
 ```
+
+
 https://bgreenwell.github.io/pdp/articles/pdp-example-xgboost.html
 
+## Stat pour app
 
 ```{r stat pour app, eval=F}
 rpu = fread("data/datasets/rpu.csv")
@@ -420,15 +428,29 @@ moyenne_de_saison_tot = rpu[year(date)%in%train_years,.(nb=sum(nb)),by=.(cod_ror
 setnames(moyenne_de_saison_tot,"weekdays","weekday")
 moyenne_de_saison_mode_sortie_age = rpu[year(date)%in%train_years,.(nb=sum(nb)),by=.(cod_ror_eg,date,mode_sortie,categorie_age)][,.(nb = mean(nb)),by=.(month(date),weekdays(date),cod_ror_eg,mode_sortie,categorie_age)]
 setnames(moyenne_de_saison_mode_sortie_age,"weekdays","weekday")
-
+vars_gtrends = setdiff(names(gtrends),"date")
+save(vars_gtrends,file = "data/vars_gtrends.RData")
 moyenne_de_saison_external = data[,.(temp_min = mean(temp_min,na.rm=T),
                                      temp_max = mean(temp_max,na.rm=T), 
-                                     rhinopharyngite = mean(rhinopharyngite,na.rm=T),
+                                     # rhinopharyngite = mean(rhinopharyngite,na.rm=T),
                                      NO2 = mean(NO2polluant_q5,na.rm=T),
-                                     O3 = mean(O3polluant_q5,na.rm=T)),by=.(week(date),cod_ror_eg)]
+                                     O3 = mean(O3polluant_q5,na.rm=T),
+                                     CO = mean(COpolluant_q5,na.rm=T),
+                                     SO2 = mean(SO2polluant_q5,na.rm=T),
+                                     PM10 = mean(PM10polluant_q5,na.rm=T),
+                                     PM25 = mean(PM25polluant_q5,na.rm=T)),
+                                  by=.(week(date),cod_ror_eg)]
+moyenne_de_saison_gtrends = data[,lapply(.SD,mean,na.rm=T),
+                                  by=.(week(date),cod_ror_eg),.SDcols=vars_gtrends]
+nrow(moyenne_de_saison_gtrends)
+nrow(moyenne_de_saison_external)
+
+moyenne_de_saison_external = merge(moyenne_de_saison_external,moyenne_de_saison_gtrends,by=c("week","cod_ror_eg"))
+
 save(moyenne_de_saison_tot,moyenne_de_saison_mode_sortie_age,moyenne_de_saison_external,file = "data/prepared/moyennes_de_saison.RData")
 ```
 
+## IML
 
 ```{r}
 library(pdp)      # for partial dependence plots (PDPs)
