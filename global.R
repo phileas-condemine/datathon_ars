@@ -42,3 +42,4 @@ load("data/prepared/moyennes_de_saison.RData")
 
 
 
+suppressWarnings(explainer_xgboost <- lime(test_tout[,vars_explicatives,with=F], bst_tout, n_bins = 5))

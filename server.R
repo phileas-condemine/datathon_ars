@@ -146,14 +146,14 @@ function(input,output,session){
   
   
   observe({
-    req(c(input$date_focus,input$nm_eta))
-    explainer_xgboost <- lime(test_tout[,vars_explicatives,with=F], bst_tout, n_bins = 5)
+    req(input$date_focus)
+    req(input$nm_eta)
     
     focus_data = test_tout[date %in% input$date_focus & cod_ror_eg %in% input$nm_eta]
     output$cat_age = renderUI(selectInput("choix_age","Catégorie d'âge",choices = unique(focus_data$categorie_age)))
     req(input$choix_age)
     focus_data = focus_data[categorie_age == input$choix_age]
-    
+    req(nrow(focus_data)==1)
     explanation_xgboost <- explain(
       x = focus_data[,vars_explicatives,with=F], 
       explainer = explainer_xgboost, 
