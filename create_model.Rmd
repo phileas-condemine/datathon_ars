@@ -1,0 +1,475 @@
+---
+title: "Défi2 - données environnementales"
+author: "Philéas Condemine"
+date: "25/11/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Packages 
+
+```{r packages}
+library(plotly)
+library(data.table)
+library(readxl)
+library(lubridate)
+library(glmnet)
+library(gbm)
+library(xgboost)
+library(dplyr)
+library(TSdist)
+library(FNN)
+library(leaflet)
+library(fasttime)
+library(pbapply)
+# library(reticulate)
+setDTthreads(6L)
+```
+
+```{r}
+GainAUC = function(y_pred, y_obs){
+  dt = data.table(y_pred=y_pred,y_obs=y_obs)
+  setorder(dt,-y_pred)
+  dt$prop_pred = 1:nrow(dt)/nrow(dt)
+  dt[,prop_obs := cumsum(y_obs)/sum(y_obs)]
+  # ggplot(dt,aes(x=prop_pred,y=prop_obs))+geom_line()
+  mean(dt$prop_obs)
+}
+
+Normalized_GainAUC = function(y_pred, y_obs){
+  GainAUC(y_pred, y_obs)/GainAUC(y_obs, y_obs)
+}
+```
+
+# Chargement de données
+
+```{r}
+# rpu_epidemio = fread("data/datasets/rpu_epidemio.csv")
+gtrends = fread("data/datasets/clean_ggl_trends.csv")
+gtrends[,date:=as.Date(date)]
+# gtrends = fread("data/datasets/google_trend.csv")
+# samu = fread("data/datasets/samu.csv")
+# sos = fread("data/datasets/sos.csv")
+geo_eta = fread("data/datasets/annexes/geo_correspondance.csv")
+geo_pollution = fread("data/datasets/annexes/geo_pollution.csv")
+geo_cp= fread("data/datasets/annexes/geo_code_postal.csv")
+
+
+```
+
+
+
+## Prep pollution
+
+
+### à l'établissement
+
+
+```{r}
+
+pollution = fread("data/datasets/pollution_melted.csv")
+
+pollution = merge(pollution,geo_pollution[,.SD[1],by=station,.SDcols=c("lon","lat","dep","Type")],by="station")
+
+setnames(pollution,"datetime","date_hour")
+pollution[,date_hour:=fastPOSIXct(date_hour)]
+pollution[,date:=as.Date(date_hour)]
+
+pollution = pollution[Type!="T"]
+molecules = unique(pollution$molecule)
+
+pollution_vars_mm = paste0(molecules,"_mm3")
+setorder(pollution,date_hour,station)
+pollution[,"mm3":=.(frollmean(value,3)),
+          by=.(station,molecule,hour(date_hour))]
+pollution[,hour:=hour(date_hour)]
+pollution_mms = pollution[hour%in%c(7,12,17,23)]
+pollution_mms[,variable:=paste0(molecule,"_polluant_",hour,"h_mm3")]
+pollution_mms = dcast(pollution_mms,date + station ~ variable,value.var = "mm3",fun.aggregate = function(x)x[1])
+pollution_vars_mm = setdiff(colnames(pollution_mms),c("station","date"))
+
+
+pollution_station = pollution[,.(q_num = paste0("polluant_q",0:10),q_val =quantile(value,0:10/10)),by=c("station","date","molecule")]
+pollution_station$molq = paste0(pollution_station$molecule,pollution_station$q_num)
+pollution_station = dcast(pollution_station,station + date ~ molq,value.var = "q_val")
+
+
+
+molecule=sample(molecules,1)
+for (molecule in molecules){
+  print(molecule)
+  stations_molec = pollution[molecule==molecule]
+  stations_molec = na.omit(stations_molec)
+  stations_molec = stations_molec[,.SD[1],by="station",.SDcols=c("lon","lat")]
+  geo_eta[,paste0("station_",molecule) := stations_molec$station[get.knnx(query = geo_eta[,.(lon,lat)],data = stations_molec[,.(lon,lat)],k=1)$nn.index]]
+}
+
+```
+
+
+
+## Prep météo
+
+```{r}
+meteo = fread("data/datasets/meteo.csv")
+meteo[,lat:=NULL]
+geo_meteo = fread("data/datasets/annexes/geo_meteo.csv")
+
+meteo = merge(meteo,geo_meteo,by="city_name")
+
+setnames(meteo,"date","date_hour")
+meteo[,date_hour:=fastPOSIXct(date_hour)]
+meteo[,date:=as.Date(date_hour)]
+setorder(meteo,city_name,date_hour)
+
+#### Stat sur la journée
+meteo_ville = meteo[,.(temp_min = min(temp_min),temp_max = max(temp_max),humidity_max = max(humidity),snow_nb = mean(weather_main=="Snow"),rain_nb = mean(weather_main%in%c("Drizzle","Rain")),thunder_nb = mean(weather_main=="Thunderstorm")),by=c("city_name","date")]
+
+#### Moyenne mobile
+raw_vars_meteo = c("temp_min","temp_max","pressure","humidity","wind_speed")
+mm_meteo = paste0(raw_vars_meteo,"_mm3")
+meteo[,paste0(raw_vars_meteo,"_mm3"):=(lapply(.SD,function(x)frollmean(x,3))),
+      by=.(city_name,hour(date_hour)),.SDcols=raw_vars_meteo]
+meteo[,hour:=hour(date_hour)]
+meteo = meteo[,c(paste0(raw_vars_meteo,"_mm3"),"city_name","date","hour"),with=F]
+meteo = melt(meteo,value.name="value",id.vars = c("city_name","date","hour"))
+meteo = meteo[hour%in%c(7,12,17,23)]
+meteo[,variable:=paste0(variable,"_",hour,"h")]
+meteo = dcast(meteo,date + city_name ~ variable,value.var = "value",fun.aggregate = function(x)x[1])
+meteo_mms = setdiff(colnames(meteo),c("city_name","date"))
+geo_eta[,"station_meteo" := geo_meteo$city_name[get.knnx(query = geo_eta[,.(lon,lat)],data = geo_meteo[,.(lon,lat)],k=1)$nn.index]]
+```
+
+
+
+## Prep RPU
+
+```{r}
+info_eta = fread("data/datasets/annexes/info_eta.txt")
+table(info_eta$Statut)
+info_eta[Statut=="public",Statut:="PUBLIC"]
+info_eta[Statut=="prive",Statut:="PL"]
+# table(info_eta$as_activite_lib)
+# table(info_eta$Type_urgences,info_eta$ID_ROR)
+setnames(info_eta,"ID_ROR","cod_ror_eg")
+adulte_ou_ped = unique(info_eta[,.(cod_ror_eg,Type_urgences)])
+# dcast(info_eta,cod_ror_eg + Type)
+```
+
+
+```{r}
+for (my_mode_sortie in c(
+  # "tout",
+                         "hospi","rad")){
+  
+  rpu = fread("data/datasets/rpu.csv")
+  rpu = rpu[!(impute)]
+  # rpu[,.(sum(nb,na.rm=T)),by="mode_sortie"]
+  my_mode_sortie = "tout"
+  # my_mode_sortie = "hospi"
+  # my_mode_sortie = "hospi"
+  print(my_mode_sortie)
+  if (my_mode_sortie == "hospi"){
+    ### "HOSPITALISATION" SEULEMENT
+    rpu = rpu[mode_sortie == "mutation/transfert/deces"]
+  } else if (my_mode_sortie == "tout") {
+    ### TOUS MODES DE SORTIE
+    rpu = rpu[,.(nb=sum(nb)),by=c("cod_ror_eg","categorie_age","date")]
+  } else if (my_mode_sortie == "rad") {
+    ### TOUS MODES DE SORTIE
+    rpu = rpu[mode_sortie == "domicile"]
+  }
+  
+  
+  rpu=rpu[categorie_age!="inconnu"]
+  table(rpu$categorie_age)
+  rpu[categorie_age%in%c("adulte","vieux"),"Type_urgences":="Adulte"]
+  rpu[categorie_age%in%c("nourrisson","enfant"),"Type_urgences":="Pédiatrie"]
+  
+  rpu = merge(rpu,adulte_ou_ped,by=c("cod_ror_eg","Type_urgences"))
+  
+  rpu = merge(rpu, geo_eta[,c("cod_ror_eg","lon","lat",paste0("station_",molecules),"station_meteo"),with=F][,.SD[1],by="cod_ror_eg"],by="cod_ror_eg")
+  
+  # rpu = rpu[mode_sortie == ""]
+  rpu[,date:=as.Date(date)]
+  rpu[,weekday := weekdays(date)]
+  rpu[,year := year(date)]
+  
+  rpu = rpu[!is.na(nb)]
+  
+  for (DELAI in 1:7){
+    print(DELAI)
+    rpu_lag = rpu[,.(date,cod_ror_eg,categorie_age,nb)]
+    rpu_lag = rpu_lag[,.SD[1],by=.(date,cod_ror_eg,categorie_age)]
+    setnames(rpu_lag,"nb",paste0("nb_lagged",DELAI))
+    rpu_lag[,date:=date+DELAI]
+    rpu = merge(rpu,rpu_lag,by=c("date","cod_ror_eg","categorie_age"))
+    # rpu = unique(rpu)
+    rpu = rpu[!is.na(rpu[[paste0("nb_lagged",DELAI)]])]
+  }
+  rpu = rpu[!is.na(nb_lagged7)]
+  
+  nrow(rpu)
+  
+  train_years = 2012:2017
+  
+  rpu_moments_train = rpu[year(date)%in%train_years,.(flux_moment1=mean(nb),flux_moment2 = mean(nb^2),flux_q9 = quantile(nb,.9),flux_moment3 = mean(nb^3),flux_moment4 = mean(nb^4)),by=.(categorie_age,cod_ror_eg)]
+  rpu = merge(rpu,rpu_moments_train,by=c("categorie_age","cod_ror_eg"))
+  
+  vars_moment_eta = c("flux_q9",paste0("flux_moment",1:4))
+  nrow(rpu)
+  
+  calendrier = fread("data/calendrier_scolaire.csv",select=c("date","vacances_zone_c","nom_vacances"))
+  calendrier[,date:=as.Date(date)]
+  setorder(calendrier,date)
+  
+  calendrier$ieme_jour_vacances[1] = calendrier$vacances_zone_c[1]*1
+  calendrier$distance_apres_vacances[1] = !calendrier$vacances_zone_c[1]*1
+  
+  for (i in 2:nrow(calendrier)){
+    calendrier$ieme_jour_vacances[i] = (calendrier$ieme_jour_vacances[i-1] + calendrier$vacances_zone_c[i]) *  calendrier$vacances_zone_c[i]
+    calendrier$distance_apres_vacances[i] = (calendrier$distance_apres_vacances[i-1] + !(calendrier$vacances_zone_c[i])) *  !(calendrier$vacances_zone_c[i])
+  }
+  setorder(calendrier,-date)
+  calendrier$distance_avant_vacances[1] = !calendrier$vacances_zone_c[1]*1
+  for (i in 2:nrow(calendrier)){
+    calendrier$distance_avant_vacances[i] = (calendrier$distance_avant_vacances[i-1] + !(calendrier$vacances_zone_c[i])) *  !(calendrier$vacances_zone_c[i])
+  }
+  
+  rpu = merge(rpu,calendrier,by="date")
+  
+  jours_feries = fread("data/datasets/jours-feries.csv")
+  jours_feries[,date:=as.Date(date)]
+  setorder(jours_feries,date)
+  
+  jours_feries$j1_apres_jour_ferie[1]=F
+  for(i in 2:nrow(jours_feries)){
+    jours_feries$j1_apres_jour_ferie[i] = (jours_feries$est_jour_ferie[i-1])&!(jours_feries$est_jour_ferie[i])
+  }
+  
+  
+  rpu = merge(rpu, jours_feries,by="date")
+  setorder(rpu,date)
+  one_eta = sample(unique(rpu$cod_ror_eg),1)
+  # View(rpu[cod_ror_eg==one_eta,c("date","vacances_zone_c","ieme_jour_vacances","categorie_age"),with=F])
+  vars_ferie_vacances = c("est_jour_ferie","vacances_zone_c",
+                          "ieme_jour_vacances",
+                          "distance_apres_vacances",
+                          "distance_avant_vacances","j1_apres_jour_ferie")
+  
+  sort(names(rpu))
+  
+  # data = merge(rpu,meteo_dep,by=c("date","dep"))
+  # data = merge(data,pollution_dep,by=c("date","dep"))
+  data = merge(rpu,meteo_ville,by.x=c("station_meteo","date"),by.y=c("city_name","date"))
+  data = merge(data,meteo,by.x=c("station_meteo","date"),by.y=c("city_name","date"))
+  
+  
+  molecule=sample(molecules,1)
+  for (molecule in molecules){
+    print(molecule)
+    vars_molecule = names(pollution_station)[grepl(molecule,names(pollution_station))]
+    data = merge(data,pollution_station[,c("station","date",vars_molecule),with=F],by.x=c("date",paste0("station_",molecule)),by.y = c("date","station"))
+    vars_molecule = names(pollution_mms)[grepl(molecule,names(pollution_mms))]
+    data = merge(data,pollution_mms[,c("station","date",vars_molecule),with=F],by.x=c("date",paste0("station_",molecule)),by.y = c("date","station"))
+    
+  }
+  
+  
+  data = merge(data,gtrends,by=c("date"))
+  
+  gvars = setdiff(colnames(gtrends),"date")
+  polluant_quantiles = names(data)[grepl("polluant",names(data))]
+  
+  data$id = 1:nrow(data)
+  
+  one_hot = dcast(melt(data[,.(categorie_age,weekday,id,nom_vacances,nom_jour_ferie)], id.vars=c('id')), id ~ variable + value,fun.aggregate = length)
+  vars_one_hot = setdiff(colnames(one_hot),"id")
+  
+  data = data %>% merge(one_hot,
+                        by="id")
+  
+  # train_dep = sample(unique(data$dep),5)
+  
+  train = data[year %in% train_years]
+  table(train$year)
+  test = data[!year %in% train_years]
+  table(test$year)
+  
+  
+  vars_explicatives = c(paste0("nb_lagged",1:7),"year","vacances_zone_c",
+                        "temp_min","temp_max","humidity_max","snow_nb","rain_nb","thunder_nb",
+                        vars_one_hot,vars_moment_eta,vars_ferie_vacances,
+                        gvars,polluant_quantiles,meteo_mms,pollution_vars_mm)
+  save(vars_explicatives,file="data/varexp.RData")
+  m_train = as.matrix(train[,vars_explicatives,with=F])
+  m_test = as.matrix(test[,vars_explicatives,with=F])
+  
+  
+  dtrain <- xgb.DMatrix(m_train, label = train$nb)
+  dtest <- xgb.DMatrix(m_test, label = test$nb)
+  watchlist <- list(train = dtrain, eval = dtest)
+  
+  
+  ## A simple xgb.train example:
+  param <- list(max_depth = 3, eta = .15, verbose = 1, nthread = 6,colsample_bytree=0.5,subsample=.5
+                # ,objective = "count:poisson", eval_metric = "poisson-nloglik"
+                # ,objective = "reg:linear",eval_metric = 'rmse'
+  )
+  bst <- xgb.train(param, dtrain, nrounds = 200, watchlist,early_stopping_rounds = 50
+                   # ,xgb_model = linear_model
+  )
+  var_imp = xgb.importance(model = bst,feature_names = vars_explicatives)
+  var_imp
+  
+  
+  
+  pred = predict(bst,dtest)
+  print(c("gini"=  Normalized_GainAUC(pred,test$nb),
+    "rmse"=sqrt(mean((pred-test$nb)^2)),
+    "mae"=mean(abs(pred-test$nb))))
+  
+  
+  xgb.save(bst,paste0("data/prepared/model_",my_mode_sortie,".xgb"))
+  
+  
+  test$pred = predict(bst,dtest)
+  # save(vars_explicatives,file="data/prepared/varexp.RData")
+  save(test,file = paste0("data/prepared/test_",my_mode_sortie,".RData"))
+}
+
+
+```
+
+
+
+
+```{r eval=F}
+list_varexp = list(
+  AR = paste0("nb_lagged",1:7),
+  AR_moment = c(paste0("nb_lagged",1:7),vars_moment_eta),
+  AR_moment_age = c(paste0("nb_lagged",1:7),vars_moment_eta,paste0("categorie_age_",c("adulte","vieux","enfant"))),
+  AR_moment_age_calendrier = c(paste0("nb_lagged",1:7),vars_moment_eta,vars_ferie_vacances,vars_one_hot,"year","vacances_zone_c"),
+  AR_moment_age_calendrier_meteo = c(paste0("nb_lagged",1:7),vars_moment_eta,vars_ferie_vacances,vars_one_hot,"year","vacances_zone_c","temp_min","temp_max","humidity_max","snow_nb","rain_nb","thunder_nb",meteo_mms),
+  AR_moment_age_calendrier_pollution = c(paste0("nb_lagged",1:7),vars_moment_eta,vars_ferie_vacances,vars_one_hot,"year","vacances_zone_c",polluant_quantiles,pollution_vars_mm),
+  AR_moment_age_calendrier_gtrends = c(paste0("nb_lagged",1:7),vars_moment_eta,vars_ferie_vacances,vars_one_hot,"year","vacances_zone_c",gvars),
+  all = c(paste0("nb_lagged",1:7),"year","vacances_zone_c",
+          "temp_min","temp_max","humidity_max","snow_nb","rain_nb","thunder_nb",
+          vars_one_hot,vars_moment_eta,vars_ferie_vacances,
+          gvars,polluant_quantiles,meteo_mms,pollution_vars_mm)
+  
+  
+)
+
+
+run_model = function(vars_explicatives){
+  m_train = as.matrix(train[,vars_explicatives,with=F])
+  m_test = as.matrix(test[,vars_explicatives,with=F])
+  
+  
+  dtrain <- xgb.DMatrix(m_train, label = train$nb)
+  dtest <- xgb.DMatrix(m_test, label = test$nb)
+  watchlist <- list(train = dtrain, eval = dtest)
+  
+  
+  ## A simple xgb.train example:
+  param <- list(max_depth = 3, eta = .15, verbose = 1, nthread = 6,colsample_bytree=0.5,subsample=.5,
+                # objective = "count:poisson", eval_metric = "poisson-nloglik"
+                objective = "reg:linear",eval_metric = 'rmse'
+                
+  )
+  bst <- xgb.train(param, dtrain, nrounds = 200, watchlist,early_stopping_rounds = 50
+                   # ,xgb_model = linear_model
+  )
+  var_imp = xgb.importance(model = bst,feature_names = vars_explicatives)
+  var_imp
+  
+  
+  
+  pred = predict(bst,dtest)
+  return(c("gini"=  Normalized_GainAUC(pred,test$nb),
+           "rmse"=sqrt(mean((pred-test$nb)^2)),
+           "mae"=mean(abs(pred-test$nb))
+  ))
+}
+
+perf_models = pbapply::pblapply(list_varexp,run_model)
+do.call("rbind",perf_models)
+save(perf_models,file=paste0("data/res_",my_mode_sortie,".RData"))
+```
+
+
+
+
+```{r}
+```
+https://bgreenwell.github.io/pdp/articles/pdp-example-xgboost.html
+
+
+```{r stat pour app, eval=F}
+rpu = fread("data/datasets/rpu.csv")
+rpu = rpu[!(impute)]
+rpu[,date:=as.Date(date)]
+rpu[,weekday := weekdays(date)]
+rpu[,year := year(date)]
+rpu = rpu[!is.na(nb)]
+moyenne_de_saison_tot = rpu[year(date)%in%train_years,.(nb=sum(nb)),by=.(cod_ror_eg,date)][,.(nb = mean(nb)),by=.(month(date),weekdays(date),cod_ror_eg)]
+setnames(moyenne_de_saison_tot,"weekdays","weekday")
+moyenne_de_saison_mode_sortie_age = rpu[year(date)%in%train_years,.(nb=sum(nb)),by=.(cod_ror_eg,date,mode_sortie,categorie_age)][,.(nb = mean(nb)),by=.(month(date),weekdays(date),cod_ror_eg,mode_sortie,categorie_age)]
+setnames(moyenne_de_saison_mode_sortie_age,"weekdays","weekday")
+
+moyenne_de_saison_external = data[,.(temp_min = mean(temp_min,na.rm=T),
+                                     temp_max = mean(temp_max,na.rm=T), 
+                                     rhinopharyngite = mean(rhinopharyngite,na.rm=T),
+                                     NO2 = mean(NO2polluant_q5,na.rm=T),
+                                     O3 = mean(O3polluant_q5,na.rm=T)),by=.(week(date),cod_ror_eg)]
+save(moyenne_de_saison_tot,moyenne_de_saison_mode_sortie_age,moyenne_de_saison_external,file = "data/prepared/moyennes_de_saison.RData")
+```
+
+
+```{r}
+library(pdp)      # for partial dependence plots (PDPs)
+library(vip)      # for variable importance plots (VIPs)
+```
+
+
+```{r}
+vip(bst, num_features = 30)%>%ggplotly  # 10 is the default
+```
+
+
+```{r}
+x <- data.matrix(m_train[sample(nrow(m_train),1000),])  # training features
+p1 <- partial(bst, pred.var = var_imp$Feature[1], ice = TRUE, center = TRUE, 
+              plot = TRUE, rug = TRUE, alpha = 0.1, plot.engine = "ggplot2", 
+              train = x)
+p1%>%ggplotly
+p2 <- partial(bst, pred.var = "nom_jour_ferie_", ice = TRUE, center = TRUE, 
+              plot = TRUE, rug = TRUE, alpha = 0.1, plot.engine = "ggplot2",
+              train = x)
+p2%>%ggplotly
+
+p2 <- partial(bst, pred.var = "NO2polluant_q8", ice = TRUE, center = TRUE, 
+              plot = TRUE, rug = TRUE, alpha = 0.1, plot.engine = "ggplot2",
+              train = x)
+p2%>%ggplotly
+
+
+p3 <- partial(bst, pred.var = c("temp_max","NO2polluant_q8"),
+              plot = TRUE, chull = TRUE, plot.engine = "ggplot2", train = x)
+p3%>%ggplotly
+# Figure 2
+```
+
+
+
+
+
+
+
+
+
+
